@@ -1,5 +1,17 @@
 import React, { useMemo, useState } from "react";
 
+// Token limits (must match backend). Approx 4 chars per token for UI cap.
+const USER_PROMPT_MAX_TOKENS = 1000;
+const SYSTEM_PROMPT_MAX_TOKENS = 500;
+const CHARS_PER_TOKEN_APPROX = 4;
+
+const userPromptMaxChars = USER_PROMPT_MAX_TOKENS * CHARS_PER_TOKEN_APPROX;
+const systemPromptMaxChars = SYSTEM_PROMPT_MAX_TOKENS * CHARS_PER_TOKEN_APPROX;
+
+function approxTokens(text: string): number {
+  return Math.ceil(text.length / CHARS_PER_TOKEN_APPROX);
+}
+
 type ChatResponse = {
   prompt: string;
   label: "safe" | "unsafe";
@@ -96,10 +108,17 @@ export function App() {
           <textarea
             className="textarea"
             value={systemPrompt}
-            onChange={(e) => setSystemPrompt(e.target.value)}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v.length <= systemPromptMaxChars) setSystemPrompt(v);
+            }}
             rows={8}
             placeholder="Enter a custom system prompt..."
+            maxLength={systemPromptMaxChars}
           />
+          <div className="hint" style={{ marginTop: 6 }}>
+            Approx. tokens: {approxTokens(systemPrompt)}/{SYSTEM_PROMPT_MAX_TOKENS}
+          </div>
           <label className="checkboxRow">
             <input
               type="checkbox"
@@ -162,17 +181,22 @@ export function App() {
             <textarea
               className="textarea"
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v.length <= userPromptMaxChars) setInput(v);
+              }}
               onKeyDown={onKeyDown}
               rows={3}
               placeholder="Enter a prompt..."
               disabled={loading}
+              maxLength={userPromptMaxChars}
             />
             <button className="button" disabled={!canSend} onClick={send}>
               {loading ? "Sending..." : "Send"}
             </button>
           </div>
           <div className="hint">
+            Approx. tokens: {approxTokens(input)}/{USER_PROMPT_MAX_TOKENS}.{" "}
             Tip: <code>Ctrl</code>+<code>Enter</code> to send.
           </div>
         </section>

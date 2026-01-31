@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn classification:app --host 0.0.0.0 --port 9000
+    env_file:
+      - .env
+    environment:
+      # Make sure MODEL_DIR points to the model inside the container
+      MODEL_DIR: /app/fine_tuned_mobilebert_model_colab
+    ports:
+      - "9000:9000"
+
+  chat_api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn chat_api:app --host 0.0.0.0 --port 9001
+    env_file:
+      - .env
+    environment:
+      # Inside Docker network, talk to classifier by service name, not localhost
+      PREDICT_URL: http://classifier:9000/predict
+      # Optional: override CORS origins if needed
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    ports:
+      - "9001:9001"
+    depends_on:
+      - classifier
