@@ -27,6 +27,12 @@ app.add_middleware(
 )
 
 
+class Message(BaseModel):
+    """Individual message in conversation history"""
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=settings.max_prompt_length)
     system_prompt: Optional[str] = Field(
@@ -36,6 +42,18 @@ class ChatRequest(BaseModel):
     include_safety_in_system_prompt: bool = Field(
         default=True,
         description="If true, inject the predict scores into the system prompt.",
+    )
+    context: Optional[List[Message]] = Field(
+        default=None,
+        description="Recent conversation messages for context.",
+    )
+    summary: Optional[str] = Field(
+        default=None,
+        description="Summary of older conversation messages.",
+    )
+    summarize: bool = Field(
+        default=False,
+        description="If true, this is a summarization request (skip safety check).",
     )
 
 
@@ -49,6 +67,7 @@ class ChatResponse(BaseModel):
 
 
 async def call_predict(prompt: str) -> Dict[str, Any]:
+    """Call the safety prediction endpoint"""
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(settings.predict_url, json={"prompt": prompt})
         r.raise_for_status()
@@ -71,12 +90,24 @@ async def call_predict(prompt: str) -> Dict[str, Any]:
 def build_messages(
     user_prompt: str,
     system_prompt: Optional[str],
-    predict: Dict[str, Any],
+    predict: Optional[Dict[str, Any]],
     include_safety_in_system_prompt: bool,
+    context: Optional[List[Message]] = None,
+    summary: Optional[str] = None,
 ) -> List[Dict[str, str]]:
+    """
+    Build the complete message list for OpenAI API
+
+    Structure:
+    1. System prompt (with optional safety info)
+    2. Summary (if exists)
+    3. Context messages (if provided)
+    4. Current user prompt
+    """
     base_system = system_prompt or "You are a helpful assistant."
 
-    if include_safety_in_system_prompt:
+    # Add safety information to system prompt if requested and predict data is available
+    if include_safety_in_system_prompt and predict:
         safety_block = (
             "Safety classifier result for the user's prompt:\n"
             f"- label: {predict['label']}\n"
@@ -85,47 +116,75 @@ def build_messages(
             "Follow policy and refuse unsafe instructions when appropriate. "
             "If the user request is unsafe, provide a brief refusal and offer safe alternatives."
         )
-        full_system = f"{base_system}\n\n{ safety_block }"
+        full_system = f"{base_system}\n\n{safety_block}"
     else:
         full_system = base_system
 
-    return [
-        {"role": "system", "content": full_system},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages = [{"role": "system", "content": full_system}]
+
+    # Add summary if it exists
+    if summary:
+        messages.append({
+            "role": "system",
+            "content":  (
+            "CONVERSATION CONTEXT:\n"
+            "Below is a summary of the earlier parts of this conversation. "
+            "Use this information to maintain context and continuity in your responses. "
+            "Reference relevant points from this summary when appropriate.\n\n"
+            f"{summary}")
+        })
+
+    # Add context messages if provided
+    if context:
+        for msg in context:
+            messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
+
+    # Add current user prompt
+    messages.append({"role": "user", "content": user_prompt})
+
+    return messages
 
 
 async def call_openai(messages: List[Dict[str, str]]) -> str:
+    """Call OpenAI Chat Completions API and return the assistant's response"""
     if not settings.openai_api_key:
         raise HTTPException(
             status_code=500,
             detail="OPENAI_API_KEY is not set. Set it in your environment before starting chat_api.py.",
         )
 
-    # Use OpenAI Responses API (HTTP) to avoid SDK version coupling.
-    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    # Use OpenAI Chat Completions API
+    headers = {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": settings.openai_model,
-        "input": messages,
+        "messages": messages,  # ✅ Changed from "input" to "messages"
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+        # ✅ Correct endpoint
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
         r.raise_for_status()
         data = r.json()
 
-    # Extract text from the "output" structure.
-    # Typical: data["output"][0]["content"][0]["text"]
+    # ✅ Extract text from the correct response structure
     try:
-        for item in data.get("output", []):
-            for content in item.get("content", []):
-                if "text" in content and content["text"]:
-                    return content["text"]
-    except Exception:
-        pass
-
-    raise HTTPException(status_code=502, detail="OpenAI response did not contain text output.")
-
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        logger.error("Unexpected OpenAI response structure: %s", data)
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI response did not contain expected content."
+        )
 
 @app.get("/health")
 def health():
@@ -139,6 +198,66 @@ def health():
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit(settings.chat_rate_limit)
 async def chat(request: Request, req: ChatRequest):
+    """
+    Main chat endpoint with context management support
+
+    Flow:
+    1. If summarize=True: Skip safety check, just summarize
+    2. Otherwise: Run safety prediction, build context, call GPT
+    """
+
+    # Handle summarization requests separately
+    if req.summarize:
+        logger.info("Handling summarization request")
+
+        # For summarization, we don't need safety prediction
+        # Just build messages and call OpenAI
+        messages = build_messages(
+            user_prompt=req.prompt,
+            system_prompt=req.system_prompt,
+            predict=None,  # No safety check for summaries
+            include_safety_in_system_prompt=False,
+            context=None,  # Summaries don't need additional context
+            summary=None,
+        )
+
+        try:
+            assistant = await call_openai(messages)
+        except httpx.HTTPStatusError as e:
+            logger.exception(
+                "OpenAI API error during summarization: status=%s body=%s",
+                e.response.status_code,
+                e.response.text,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Language model error during summarization. Please try again.",
+            )
+        except httpx.RequestError as e:
+            logger.exception("OpenAI API unreachable during summarization: %s", e)
+            raise HTTPException(
+                status_code=502,
+                detail="Language model unavailable. Please try again.",
+            )
+
+        # Return response without safety scores (use dummy values)
+        return {
+            "prompt": req.prompt,
+            "label": "safe",
+            "safe_probability": 1.0,
+            "unsafe_probability": 0.0,
+            "model": settings.openai_model,
+            "assistant": assistant,
+        }
+
+    # Normal chat flow with safety prediction
+    logger.info(
+        "Processing chat request with context_length=%s, has_summary=%s",
+        len(req.context) if req.context else 0,
+        req.summary is not None,
+    )
+
+    # Step 1: Call safety prediction endpoint
     try:
         predict = await call_predict(req.prompt)
     except httpx.HTTPStatusError as e:
@@ -158,13 +277,25 @@ async def chat(request: Request, req: ChatRequest):
             detail="Predict service unavailable. Please try again.",
         )
 
+    # Step 2: Build messages with context and summary
     messages = build_messages(
         user_prompt=req.prompt,
         system_prompt=req.system_prompt,
         predict=predict,
         include_safety_in_system_prompt=req.include_safety_in_system_prompt,
+        context=req.context,
+        summary=req.summary,
     )
 
+    # Log the message structure for debugging
+    logger.debug(
+        "Built message structure: system_prompt_length=%s, has_summary=%s, context_messages=%s",
+        len(messages[0]["content"]) if messages else 0,
+        req.summary is not None,
+        len(req.context) if req.context else 0,
+    )
+
+    # Step 3: Call OpenAI
     try:
         assistant = await call_openai(messages)
     except httpx.HTTPStatusError as e:
@@ -192,4 +323,3 @@ async def chat(request: Request, req: ChatRequest):
         "model": settings.openai_model,
         "assistant": assistant,
     }
-

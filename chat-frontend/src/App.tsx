@@ -1,9 +1,12 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useCallback,useEffect } from "react";
 
 // Token limits (must match backend). Approx 4 chars per token for UI cap.
 const USER_PROMPT_MAX_TOKENS = 1000;
 const SYSTEM_PROMPT_MAX_TOKENS = 500;
 const CHARS_PER_TOKEN_APPROX = 4;
+const MAX_RECENT_MESSAGES = 10; // Keep last 10 messages in context (5 pairs)
+const SUMMARIZE_AFTER = 16; // Trigger summarization after 16 messages (8 pairs)
+const SUMMARIZE_BATCH = 6; // Summarize 6 oldest messages at a time
 
 const userPromptMaxChars = USER_PROMPT_MAX_TOKENS * CHARS_PER_TOKEN_APPROX;
 const systemPromptMaxChars = SYSTEM_PROMPT_MAX_TOKENS * CHARS_PER_TOKEN_APPROX;
@@ -19,6 +22,7 @@ type ChatResponse = {
   unsafe_probability: number;
   model: string;
   assistant: string;
+  summary?: string; // New field for summary response
 };
 
 type Msg = { role: "user" | "assistant"; content: string };
@@ -29,7 +33,15 @@ export function App() {
   );
   const [includeSafety, setIncludeSafety] = useState<boolean>(true);
   const [input, setInput] = useState<string>("");
-  const [messages, setMessages] = useState<Msg[]>([]);
+
+  // SEPARATE STATE: Display messages (never trimmed, always grows)
+  const [displayMessages, setDisplayMessages] = useState<Msg[]>([]);
+
+  // SEPARATE STATE: Context messages (trimmed for API calls)
+  const [contextMessages, setContextMessages] = useState<Msg[]>([]);
+// Auto-trigger summarization when context grows too large
+
+  const [summary, setSummary] = useState<string | null>(null);
   const [lastMeta, setLastMeta] = useState<ChatResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
@@ -38,6 +50,76 @@ export function App() {
     () => input.trim().length > 0 && !loading,
     [input, loading]
   );
+  useEffect(() => {
+    if (contextMessages.length > SUMMARIZE_AFTER && !loading) {
+      summarizeOldContext();
+    }
+  }, [contextMessages.length, loading]); // Only trigger when length changes
+  // Get messages to send (for context management)
+  const getRecentMessages = useCallback(() => {
+    // Keep only last MAX_RECENT_MESSAGES from context
+    if (contextMessages.length > MAX_RECENT_MESSAGES) {
+      return contextMessages.slice(-MAX_RECENT_MESSAGES);
+    }
+    return contextMessages;
+  }, [contextMessages]);
+
+  // Summarize old context
+  const summarizeOldContext = useCallback(async () => {
+    if (contextMessages.length <= SUMMARIZE_AFTER) return;
+
+    try {
+      // Take first SUMMARIZE_BATCH messages to summarize
+      const toSummarize = contextMessages.slice(0, SUMMARIZE_BATCH);
+
+      // Build system prompt for summarization
+      let summarySystemPrompt: string;
+      if (summary) {
+        summarySystemPrompt = `You are summarizing a conversation.
+
+Here is the existing summary:
+${summary}
+
+Now add information from these new messages to create an updated summary.
+Keep it concise (under 150 words) but preserve all key facts, decisions, and context.`;
+      } else {
+        summarySystemPrompt =
+          "Summarize the following conversation concisely, keeping key facts and context. Keep it under 100 words.";
+      }
+
+      // Format messages for summarization
+      const formattedMessages = toSummarize
+        .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+        .join("\n\n");
+
+      // Call backend with summarize=true
+      const r = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: formattedMessages,
+          system_prompt: summarySystemPrompt,
+          include_safety_in_system_prompt: false,
+          summarize: true, // Flag to indicate this is a summary request
+        }),
+      });
+
+      if (!r.ok) {
+        console.error("Summarization failed");
+        return;
+      }
+
+      const data = (await r.json()) as ChatResponse;
+
+      // Update summary
+      setSummary(data.assistant);
+
+      // Remove summarized messages from CONTEXT only (NOT from display)
+      setContextMessages((prev) => prev.slice(SUMMARIZE_BATCH));
+    } catch (e) {
+      console.error("Error during summarization:", e);
+    }
+  }, [contextMessages, summary]);
 
   async function send() {
     const prompt = input.trim();
@@ -46,7 +128,11 @@ export function App() {
     setError("");
     setLoading(true);
     setInput("");
-    setMessages((m) => [...m, { role: "user", content: prompt }]);
+
+    // Add user message to BOTH display and context
+    const newUserMessage: Msg = { role: "user", content: prompt };
+    setDisplayMessages((m) => [...m, newUserMessage]);
+    setContextMessages((m) => [...m, newUserMessage]);
 
     try {
       const r = await fetch("/chat", {
@@ -55,8 +141,10 @@ export function App() {
         body: JSON.stringify({
           prompt,
           system_prompt: systemPrompt,
-          include_safety_in_system_prompt: includeSafety
-        })
+          include_safety_in_system_prompt: includeSafety,
+          context: getRecentMessages(), // Send recent messages as context
+          summary: summary, // Send existing summary
+        }),
       });
 
       if (!r.ok) {
@@ -66,7 +154,9 @@ export function App() {
           const err = JSON.parse(text) as { detail?: unknown };
           if (Array.isArray(err.detail) && err.detail.length > 0) {
             const first = err.detail[0] as { msg?: string; type?: string };
-            message = first.msg ?? (typeof err.detail[0] === "string" ? err.detail[0] : text);
+            message =
+              first.msg ??
+              (typeof err.detail[0] === "string" ? err.detail[0] : text);
           } else if (typeof err.detail === "string") {
             message = err.detail;
           } else {
@@ -80,9 +170,32 @@ export function App() {
 
       const data = (await r.json()) as ChatResponse;
       setLastMeta(data);
-      setMessages((m) => [...m, { role: "assistant", content: data.assistant }]);
+
+      // Add assistant message to BOTH display and context
+      const newAssistantMessage: Msg = {
+        role: "assistant",
+        content: data.assistant,
+      };
+      setDisplayMessages((m) => [...m, newAssistantMessage]);
+      setContextMessages((m) => [...m, newAssistantMessage]);
+
+      // Check if we need to summarize (using contextMessages length)
+      // Use setTimeout to avoid blocking the UI
+      // setTimeout(() => {
+      //   // Check against the updated contextMessages length
+      //   setContextMessages((currentContext) => {
+      //     if (currentContext.length > SUMMARIZE_AFTER) {
+      //       // Trigger summarization
+      //       summarizeOldContext();
+      //     }
+      //     return currentContext;
+      //   });
+      // }, 100);
     } catch (e: any) {
       setError(e?.message ?? String(e));
+      // Remove the user message that failed from BOTH
+      setDisplayMessages((m) => m.slice(0, -1));
+      setContextMessages((m) => m.slice(0, -1));
     } finally {
       setLoading(false);
     }
@@ -97,8 +210,8 @@ export function App() {
       <header className="header">
         <div className="title">Prompt Safety Chat</div>
         <div className="subtitle">
-          User prompt → <code>/predict</code> → GPT response (with optional custom
-          system prompt)
+          User prompt → <code>/predict</code> → GPT response (with optional
+          custom system prompt)
         </div>
       </header>
 
@@ -117,7 +230,8 @@ export function App() {
             maxLength={systemPromptMaxChars}
           />
           <div className="hint" style={{ marginTop: 6 }}>
-            Approx. tokens: {approxTokens(systemPrompt)}/{SYSTEM_PROMPT_MAX_TOKENS}
+            Approx. tokens: {approxTokens(systemPrompt)}/
+            {SYSTEM_PROMPT_MAX_TOKENS}
           </div>
           <label className="checkboxRow">
             <input
@@ -157,13 +271,13 @@ export function App() {
 
         <section className="chat">
           <div className="messages">
-            {messages.length === 0 ? (
+            {displayMessages.length === 0 ? (
               <div className="empty">
                 Type a prompt below. Press <code>Ctrl</code>+<code>Enter</code>{" "}
                 to send.
               </div>
             ) : (
-              messages.map((m, idx) => (
+              displayMessages.map((m, idx) => (
                 <div
                   key={idx}
                   className={`msg ${m.role === "user" ? "user" : "assistant"}`}
@@ -204,4 +318,3 @@ export function App() {
     </div>
   );
 }
-
